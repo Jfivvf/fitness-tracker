@@ -1,0 +1,12 @@
+# .streamlit/config.toml
+
+[server]
+# Disable all file watching (no hot‑reload):
+fileWatcherType = "none"
+# OR, if you only want to skip torch itself but still watch your app files:
+# folderWatchBlacklist = ["*/site‑packages/torch/*"]
+# Don’t auto‑rerun on every save
+runOnSave = false
+# Raise upload limit to 1 GB
+maxUploadSize = 256
+

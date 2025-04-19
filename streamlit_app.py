@@ -2,7 +2,6 @@ import streamlit as st
 import cv2
 import numpy as np
 from scipy.signal import savgol_filter, find_peaks
-from ultralytics import YOLO
 import tempfile
 import matplotlib.pyplot as plt
 
@@ -17,6 +16,8 @@ KPT_NAMES = {
 
 @st.cache_resource
 def load_model():
+    # only here do we touch ultralytics/torch
+    from ultralytics import YOLO
     return YOLO('yolo11n-pose.pt')
 
 def compute_angle(a, b, c):
@@ -72,6 +73,8 @@ uploaded_file = st.file_uploader("Выберите видео...", type=["mp4", 
 if uploaded_file is not None:
     tfile = tempfile.NamedTemporaryFile(delete=False) 
     tfile.write(uploaded_file.read())
+    tfile.flush()
+
     
     st.video(uploaded_file)
     
@@ -93,4 +96,4 @@ if uploaded_file is not None:
             st.subheader("Обработанные кадры")
             for frame in frames[::len(frames)//10]:  # Показываем каждый 10-й кадр
                 st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 
-                        caption="Обработанный кадр", use_column_width=True)
+                        caption="Обработанный кадр", use_container_width=True)
