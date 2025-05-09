@@ -193,6 +193,38 @@ if uploaded_file is not None:
             count, smoothed, peaks = count_repetitions(angles, mode)
 
             st.success(f"**Number of repetitions ({exercise}):** {count}")
+            # Annotated video generation with persistent highlight
+            is_peak = np.zeros(len(angles), dtype=bool)
+            is_peak[peaks] = True
+            cum_counts = np.cumsum(is_peak)
+            cap_in = cv2.VideoCapture(tfile.name)
+            fps = cap_in.get(cv2.CAP_PROP_FPS) or 30
+            cap_in.release()
+            h, w = frames[0].shape[:2]
+            vfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(vfile.name, fourcc, fps, (w, h))
+            # Highlight duration in seconds
+            highlight_duration = 0.5
+            highlight_len = int(fps * highlight_duration)
+            highlight_until = -1
+            for i, frame in enumerate(frames):
+                f = frame.copy()
+                angle_val = angles[i]
+                count_val = int(cum_counts[i])
+                if is_peak[i]:
+                    highlight_until = i + highlight_len
+                if i <= highlight_until:
+                    cv2.rectangle(f, (0,0), (w-1,h-1), (0,255,0), 10)
+                # Overlay angle text
+                cv2.putText(f, f"Angle: {angle_val:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+                # Overlay count text
+                cv2.putText(f, f"Count: {count_val}", (w-200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
+                out.write(f)
+            out.release()
+            # Display annotated video
+            st.video(vfile.name)
+
             with st.expander("Show plots"):
                 # Angles
                 fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 8))
@@ -210,8 +242,3 @@ if uploaded_file is not None:
                 ax2.legend(loc='upper right')
                 plt.tight_layout()
                 st.pyplot(fig)
-
-            st.subheader("Processed frames")
-            for frame in frames[::len(frames)//10]:  # Показываем каждый 10-й кадр
-                st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                        caption="Processed frame", use_container_width=True)
