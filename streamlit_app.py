@@ -165,80 +165,87 @@ def count_repetitions(angles, mode='min'):
     peaks, _ = find_peaks(data, distance=20, prominence=10)
     return len(peaks), smoothed, peaks
 
-exercises = list(EXERCISES.keys())
-exercise = st.selectbox("Select exercise to analyze", exercises)
-st.title(f"🏋️ Repetition Counter: {exercise}")
-st.write(f"Upload video for {exercise} analysis")
+upload_tab, live_stream_tab = st.tabs(["Upload video", "Live Stream"])
 
-uploaded_file = st.file_uploader("Choose a video...", type=["mp4", "avi", "mov"])
+with upload_tab:
+    exercises = list(EXERCISES.keys())
+    exercise = st.selectbox("Select exercise to analyze", exercises)
+    st.title(f"🏋️ Repetition Counter: {exercise}")
+    st.write(f"Upload video for {exercise} analysis")
 
-if uploaded_file is not None:
-    tfile = tempfile.NamedTemporaryFile(delete=False)
-    tfile.write(uploaded_file.read())
-    tfile.flush()
+    uploaded_file = st.file_uploader("Choose a video...", type=["mp4", "avi", "mov"])
 
-    st.video(uploaded_file)
-    sides = EXERCISES[exercise]
-    left_names = sides['left']
-    right_names = sides['right']
-    left_idx = [KEYPOINT_INDICES[name] for name in left_names]
-    right_idx = [KEYPOINT_INDICES[name] for name in right_names]
-    st.write(f"**Used keypoints:** {', '.join(left_names)} (indices {', '.join(map(str, left_idx))}); {', '.join(right_names)} (indices {', '.join(map(str, right_idx))})")
+    if uploaded_file is not None:
+        tfile = tempfile.NamedTemporaryFile(delete=False)
+        tfile.write(uploaded_file.read())
+        tfile.flush()
 
-    if st.button("Analyze"):
-        with st.spinner('Processing video...'):
-            frames, anglesL, anglesR, confsL, confsR, angles = analyze_exercise(tfile.name, exercise)
-            # Determine whether to detect minima or maxima for this exercise
-            mode = COUNT_MODES.get(exercise, 'min')
-            count, smoothed, peaks = count_repetitions(angles, mode)
+        st.video(uploaded_file)
+        sides = EXERCISES[exercise]
+        left_names = sides['left']
+        right_names = sides['right']
+        left_idx = [KEYPOINT_INDICES[name] for name in left_names]
+        right_idx = [KEYPOINT_INDICES[name] for name in right_names]
+        st.write(f"**Used keypoints:** {', '.join(left_names)} (indices {', '.join(map(str, left_idx))}); {', '.join(right_names)} (indices {', '.join(map(str, right_idx))})")
 
-            st.success(f"**Number of repetitions ({exercise}):** {count}")
-            # Annotated video generation with persistent highlight
-            is_peak = np.zeros(len(angles), dtype=bool)
-            is_peak[peaks] = True
-            cum_counts = np.cumsum(is_peak)
-            cap_in = cv2.VideoCapture(tfile.name)
-            fps = cap_in.get(cv2.CAP_PROP_FPS) or 30
-            cap_in.release()
-            h, w = frames[0].shape[:2]
-            vfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(vfile.name, fourcc, fps, (w, h))
-            # Highlight duration in seconds
-            highlight_duration = 0.5
-            highlight_len = int(fps * highlight_duration)
-            highlight_until = -1
-            for i, frame in enumerate(frames):
-                f = frame.copy()
-                angle_val = angles[i]
-                count_val = int(cum_counts[i])
-                if is_peak[i]:
-                    highlight_until = i + highlight_len
-                if i <= highlight_until:
-                    cv2.rectangle(f, (0,0), (w-1,h-1), (0,255,0), 10)
-                # Overlay angle text
-                cv2.putText(f, f"Angle: {angle_val:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-                # Overlay count text
-                cv2.putText(f, f"Count: {count_val}", (w-200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
-                out.write(f)
-            out.release()
-            # Display annotated video
-            st.video(vfile.name)
+        if st.button("Analyze"):
+            with st.spinner('Processing video...'):
+                frames, anglesL, anglesR, confsL, confsR, angles = analyze_exercise(tfile.name, exercise)
+                # Determine whether to detect minima or maxima for this exercise
+                mode = COUNT_MODES.get(exercise, 'min')
+                count, smoothed, peaks = count_repetitions(angles, mode)
 
-            with st.expander("Show plots"):
-                # Angles
-                fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 8))
-                ax1.plot(anglesL, label='Left Angle', color='blue', alpha=0.3)
-                ax1.plot(anglesR, label='Right Angle', color='red', alpha=0.3)
-                ax1.plot(smoothed, label='Total Angle', color='black')
-                ax1.plot(peaks, smoothed[peaks], 'x', color='red', label='Peaks')
-                ax1.set_ylabel('Angle (degrees)')
-                ax1.legend(loc='upper right')
-                # Confidence
-                ax2.plot(confsL, label='Confidence Left', color='blue', linestyle='--')
-                ax2.plot(confsR, label='Confidence Right', color='red', linestyle='--')
-                ax2.set_xlabel('Frames')
-                ax2.set_ylabel('Confidence')
-                ax2.legend(loc='upper right')
-                plt.tight_layout()
-                st.pyplot(fig)
+                st.success(f"**Number of repetitions ({exercise}):** {count}")
+                # Annotated video generation with persistent highlight
+                is_peak = np.zeros(len(angles), dtype=bool)
+                is_peak[peaks] = True
+                cum_counts = np.cumsum(is_peak)
+                cap_in = cv2.VideoCapture(tfile.name)
+                fps = cap_in.get(cv2.CAP_PROP_FPS) or 30
+                cap_in.release()
+                h, w = frames[0].shape[:2]
+                vfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+                fourcc = cv2.VideoWriter_fourcc(*'avc1')
+                out = cv2.VideoWriter(vfile.name, fourcc, fps, (w, h))
+                # Highlight duration in seconds
+                highlight_duration = 0.5
+                highlight_len = int(fps * highlight_duration)
+                highlight_until = -1
+                for i, frame in enumerate(frames):
+                    f = frame.copy()
+                    angle_val = angles[i]
+                    count_val = int(cum_counts[i])
+                    if is_peak[i]:
+                        highlight_until = i + highlight_len
+                    if i <= highlight_until:
+                        cv2.rectangle(f, (0,0), (w-1,h-1), (0,255,0), 10)
+                    # Overlay angle text
+                    cv2.putText(f, f"Angle: {angle_val:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
+                    # Overlay count text
+                    cv2.putText(f, f"Count: {count_val}", (w-200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
+                    out.write(f)
+                out.release()
+                # Display annotated video
+                st.video(vfile.name)
+
+                with st.expander("Show plots"):
+                    # Angles
+                    fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 8))
+                    ax1.plot(anglesL, label='Left Angle', color='blue', alpha=0.3)
+                    ax1.plot(anglesR, label='Right Angle', color='red', alpha=0.3)
+                    ax1.plot(smoothed, label='Total Angle', color='black')
+                    ax1.plot(peaks, smoothed[peaks], 'x', color='red', label='Peaks')
+                    ax1.set_ylabel('Angle (degrees)')
+                    ax1.legend(loc='upper right')
+                    # Confidence
+                    ax2.plot(confsL, label='Confidence Left', color='blue', linestyle='--')
+                    ax2.plot(confsR, label='Confidence Right', color='red', linestyle='--')
+                    ax2.set_xlabel('Frames')
+                    ax2.set_ylabel('Confidence')
+                    ax2.legend(loc='upper right')
+                    plt.tight_layout()
+                    st.pyplot(fig)
+
+with live_stream_tab:
+    st.title("Live Stream")
+    st.write("This is the live stream tab")
