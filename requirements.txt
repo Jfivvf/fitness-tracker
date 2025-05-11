@@ -8,3 +8,5 @@ ipykernel>=6.0.0
 streamlit>=1.26.0
 ultralytics>=8.0.0
 torch>=2.0.0
+streamlit_webrtc
+av
