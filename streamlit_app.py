@@ -79,7 +79,9 @@ def load_model():
     import torch
     from ultralytics import YOLO
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    return YOLO('yolo11n-pose.pt', device=device)
+    model = YOLO('yolo11n-pose.pt')
+    model.to(device)
+    return model
 
 model = load_model()
 
