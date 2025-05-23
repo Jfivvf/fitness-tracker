@@ -75,9 +75,11 @@ COUNT_MODES = {
 
 @st.cache_resource
 def load_model():
-    # only here do we touch ultralytics/torch
+    # только здесь работаем с ultralytics/torch и определяем устройство
+    import torch
     from ultralytics import YOLO
-    return YOLO('yolo11n-pose.pt')
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    return YOLO('yolo11n-pose.pt', device=device)
 
 model = load_model()
 
