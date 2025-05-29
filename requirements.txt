@@ -10,3 +10,6 @@ ultralytics>=8.0.0
 torch>=2.0.0
 streamlit_webrtc
 av
+mediapipe>=0.10.0
+protobuf>=3.20.0
+absl-py>=1.0.0

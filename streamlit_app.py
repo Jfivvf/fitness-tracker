@@ -1,393 +1,480 @@
-from collections import deque
 from dataclasses import dataclass, field
 import streamlit as st
 import cv2
 import numpy as np
-from scipy.signal import savgol_filter, find_peaks
 import tempfile
-import matplotlib.pyplot as plt
 import av
 from streamlit_webrtc import WebRtcMode, webrtc_streamer
-from typing import List, Optional
+import mediapipe as mp
+import os
+import sys
+import absl.logging
+import logging
+from collections import deque
 import time
 
 
-EXERCISES = {
-    'Squats': {'left': ('left_hip','left_knee','left_ankle'), 'right': ('right_hip','right_knee','right_ankle')},
-    'Pull-ups': {'left': ('left_shoulder','left_elbow','left_wrist'), 'right': ('right_shoulder','right_elbow','right_wrist')},
-    'Push-ups': {'left': ('left_shoulder','left_elbow','left_wrist'), 'right': ('right_shoulder','right_elbow','right_wrist')},
-    'Crunches': {'left': ('left_shoulder','left_hip','left_knee'), 'right': ('right_shoulder','right_hip','right_knee')},
-    'Barbell Biceps Curl': {'left': ('left_shoulder','left_elbow','left_wrist'), 'right': ('right_shoulder','right_elbow','right_wrist')},
-    'Bench Press': {'left': ('left_shoulder','left_elbow','left_wrist'), 'right': ('right_shoulder','right_elbow','right_wrist')},
-    'Chest Fly': {'left': ('left_shoulder','left_elbow','left_wrist'), 'right': ('right_shoulder','right_elbow','right_wrist')},
-    'Deadlift': {'left': ('left_shoulder','left_hip','left_knee'), 'right': ('right_shoulder','right_hip','right_knee')},
-    'Hammer Curl': {'left': ('left_shoulder','left_elbow','left_wrist'), 'right': ('right_shoulder','right_elbow','right_wrist')},
-    'Hip Thrust': {'left': ('left_shoulder','left_hip','left_knee'), 'right': ('right_shoulder','right_hip','right_knee')},
-    'Lat Pulldown': {'left': ('left_shoulder','left_elbow','left_wrist'), 'right': ('right_shoulder','right_elbow','right_wrist')},
-    'Lateral Raise': {'left': ('left_elbow','left_shoulder','left_hip'), 'right': ('right_elbow','right_shoulder','right_hip')},
-    'Leg Raises': {'left': ('left_shoulder','left_hip','left_knee'), 'right': ('right_shoulder','right_hip','right_knee')},
-    'Russian Twist': {'left': ('left_shoulder','left_hip','left_knee'), 'right': ('right_shoulder','right_hip','right_knee')}
-}
+stderr = sys.stderr
+sys.stderr = open(os.devnull, 'w')
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+logging.getLogger('tensorflow').setLevel(logging.ERROR)
+absl.logging.set_verbosity(absl.logging.ERROR)
+sys.stderr = stderr
 
-ANGLE_LABELS = {
-    'Squats': 'Knee Angle',
-    'Pull-ups': 'Elbow Angle',
-    'Push-ups': 'Elbow Angle',
-    'Crunches': 'Hip Angle',
-    'Barbell Biceps Curl': 'Elbow Angle',
-    'Bench Press': 'Elbow Angle',
-    'Chest Fly': 'Elbow Angle',
-    'Deadlift': 'Hip Angle',
-    'Hammer Curl': 'Elbow Angle',
-    'Hip Thrust': 'Hip Angle',
-    'Lat Pulldown': 'Elbow Angle',
-    'Lateral Raise': 'Shoulder Abduction Angle',
-    'Leg Raises': 'Hip Angle',
-    'Russian Twist': 'Torso Rotation Angle'
-}
+# MEDIAPIPE
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
 
 KEYPOINT_INDICES = {
-    'nose': 0,
-    'left_eye': 1,
-    'right_eye': 2,
-    'left_ear': 3,
-    'right_ear': 4,
-    'left_shoulder': 5,
-    'right_shoulder': 6,
-    'left_elbow': 7,
-    'right_elbow': 8,
-    'left_wrist': 9,
-    'right_wrist': 10,
-    'left_hip': 11,
-    'right_hip': 12,
-    'left_knee': 13,
-    'right_knee': 14,
-    'left_ankle': 15,
-    'right_ankle': 16
+    'nose': 0, 'left_eye': 2, 'right_eye': 5,
+    'left_ear': 7, 'right_ear': 8,
+    'left_shoulder': 11, 'right_shoulder': 12,
+    'left_elbow': 13, 'right_elbow': 14,
+    'left_wrist': 15, 'right_wrist': 16,
+    'left_hip': 23, 'right_hip': 24,
+    'left_knee': 25, 'right_knee': 26,
+    'left_ankle': 27, 'right_ankle': 28,
+    'left_heel': 29, 'right_heel': 30,
+    'left_foot_index': 31, 'right_foot_index': 32
 }
 
-# Specifies whether to detect minima ('min') or maxima ('max') for each exercise
-COUNT_MODES = {
-    'Lateral Raise': 'max',
-    'Leg Raises': 'min',
-    'Russian Twist': 'max'
+EXERCISES = {
+    'Squats': {
+        'points': ['left_hip', 'left_knee', 'left_ankle'],
+        'threshold': 160,  # Угол в колене в ВЕРХНЕЙ точке
+        'min_angle': 60,   # Угол в колене в НИЖГНЙ точки
+        'knee_over_toes_threshold': 0.15,  # РАЗНИЦА КОЛЕНИ - СТОПЫ
+        'speed_threshold': 0.5,  # Максимальная скорость опускания-подъема
+        'min_hip_knee_diff': -0.05,  # Минимальная разница между ТАЗОМ и КОЛЕНОМ
+        'profile_shoulder_threshold': 0.2  # ПОРОГ определения положения в профиль
+    }
 }
 
+# МОДЕЛЬ
 @st.cache_resource
 def load_model():
-    # только здесь работаем с ultralytics/torch и определяем устройство
-    import torch
-    from ultralytics import YOLO
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = YOLO('yolo11n-pose.pt')
-    model.to(device)
-    return model
+    return mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=2,
+        min_detection_confidence=0.8,
+        min_tracking_confidence=0.8,
+        enable_segmentation=False,
+        smooth_landmarks=True
+    )
 
-model = load_model()
+pose = load_model()
 
 def compute_angle(a, b, c):
     ba = a - b
     bc = c - b
-    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-8)
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-7)
     return np.degrees(np.arccos(cosine_angle))
 
-def compute_torso_rotation(a, b):
-    """Calculate torso rotation angle between two shoulders"""
-    vec = b - a
-    return np.degrees(np.arctan2(vec[1], vec[0]))
+def draw_landmarks(image, landmarks):
+    #КЛЮЧЕВЫЕ ТОЧКИИ
+    mp_drawing.draw_landmarks(
+        image,
+        landmarks,
+        mp_pose.POSE_CONNECTIONS,
+        landmark_drawing_spec=mp_drawing.DrawingSpec(
+            color=(0, 255, 0), thickness=3, circle_radius=3),
+        connection_drawing_spec=mp_drawing.DrawingSpec(
+            color=(0, 255, 0), thickness=3)
+    )
 
-def process_frame(frame):
-    results = model(frame)
-    kpts = results[0].keypoints.xy[0].cpu().numpy()
-    confs = results[0].keypoints.conf[0].cpu().numpy()
-    return kpts, confs, results[0].plot()
+def is_profile_view(kpts, frame_width):
+    #ПРОВЕРКА НА ТО, СТОИТ ЛИ ЧЕЛОВЕК В ПРОФИЛЬ
+    left_shoulder = kpts[KEYPOINT_INDICES['left_shoulder']]
+    right_shoulder = kpts[KEYPOINT_INDICES['right_shoulder']]
+   
+    #НАДО ИСПРАВИТЬ ЧАСТЬ НИЖЕ - ИНОГДА ПУТАЕТ ПРОФИЛЬ И АНФАС
 
-def get_angle_data(kpts, confs, is_russian, left_idx, right_idx):
-    try:
-        if is_russian:
-            ls = kpts[KEYPOINT_INDICES['left_shoulder']][:2]
-            rs = kpts[KEYPOINT_INDICES['right_shoulder']][:2]
-            torso_angle = compute_torso_rotation(ls, rs)
-            confL = confs[KEYPOINT_INDICES['left_shoulder']]
-            confR = confs[KEYPOINT_INDICES['right_shoulder']]
-            angleL = torso_angle
-            angleR = torso_angle
-            angle = torso_angle
+    shoulder_diff = abs(left_shoulder[0] - right_shoulder[0]) / frame_width
+    # ЕСЛИ ПЛЕЧИ БЛИЗКО - ТО ПРОФИЛЬ
+    return shoulder_diff < EXERCISES['Squats']['profile_shoulder_threshold']
+
+def is_valid_squat(kpts, exercise_config, state):
+    #УСЛОВИЯ ДЛЯ ПРОВЕРКИ НА КОРРЕКТНОСТ ПРИСЕДАНИЧ
+    hip_idx = KEYPOINT_INDICES['left_hip']
+    knee_idx = KEYPOINT_INDICES['left_knee']
+    ankle_idx = KEYPOINT_INDICES['left_ankle']
+    
+    # ПРОВЕРКА НАЛИЧИЯ ВСЕХ КЛЮЧЕВЫХ ТОЧЕК
+    if (kpts[hip_idx][0] == 0 and kpts[hip_idx][1] == 0 or
+        kpts[knee_idx][0] == 0 and kpts[knee_idx][1] == 0 or
+        kpts[ankle_idx][0] == 0 and kpts[ankle_idx][1] == 0):
+        return False
+    
+
+    hip_y = kpts[hip_idx][1]
+    knee_y = kpts[knee_idx][1]
+    ankle_y = kpts[ankle_idx][1]
+    
+    a, b, c = kpts[hip_idx], kpts[knee_idx], kpts[ankle_idx]
+    knee_angle = compute_angle(a, b, c)
+    
+    # ГЛУБИНА ПРИСЕДАНИЯ
+    min_angle_ok = knee_angle < exercise_config['min_angle']
+    hip_knee_diff_ok = (hip_y - knee_y) > exercise_config['min_hip_knee_diff'] * state['frame_height']
+    
+    is_profile = is_profile_view(kpts, state['frame_width'])
+    knee_x = kpts[knee_idx][0]
+    ankle_x = kpts[ankle_idx][0]
+    
+    if is_profile:
+        knee_over_toes_ok = (knee_x-ankle_x) < exercise_config['knee_over_toes_threshold'] * state['frame_width']
+    else:
+        knee_over_toes_ok = True
+    
+    current_time = time.time()
+    if state.get('last_hip_y') is not None and state.get('last_hip_time') is not None:
+        time_diff = current_time - state['last_hip_time']
+        if time_diff > 0:
+            speed = abs(hip_y - state['last_hip_y']) / time_diff / state['frame_height']
+            speed_ok = speed < exercise_config['speed_threshold']
         else:
-            aL, bL, cL = [kpts[i][:2] for i in left_idx]
-            aR, bR, cR = [kpts[i][:2] for i in right_idx]
-            # Проверка, что точки не равны (0, 0)
-            for point in [aL, bL, cL, aR, bR, cR]:
-                if np.array_equal(point, np.array([0, 0])):
-                    return None, None, None, confL, confR
-            angleL = compute_angle(aL, bL, cL)
-            angleR = compute_angle(aR, bR, cR)
-            confL = np.mean([confs[i] for i in left_idx])
-            confR = np.mean([confs[i] for i in right_idx])
-            if np.array_equal(aL, np.array([0, 0])) or np.array_equal(bL, np.array([0, 0])) or np.array_equal(cL, np.array([0, 0])):
-                angleL = None
-            if np.array_equal(aR, np.array([0, 0])) or np.array_equal(bR, np.array([0, 0])) or np.array_equal(cR, np.array([0, 0])):
-                angleR = None
-            if confL + confR > 1e-6:
-                angle = (confL * angleL + confR * angleR) / (confL + confR)
-                if angle is None:
-                    angle = angleL if angleL is not None else angleR
-            else:
-                angle = None
-        return angleL, angleR, angle, confL, confR
-    except Exception as e:
-        print(f"Error: {e}")
-        return None, None, None, None, None
+            speed_ok = True
+    else:
+        speed_ok = True
+    
+    state['last_hip_y'] = hip_y
+    state['last_hip_time'] = current_time
+    
+    if not is_profile and (kpts[KEYPOINT_INDICES['right_knee']][0] > 0 and 
+                          kpts[KEYPOINT_INDICES['right_ankle']][0] > 0):
+        right_knee_angle = compute_angle(
+            kpts[KEYPOINT_INDICES['right_hip']],
+            kpts[KEYPOINT_INDICES['right_knee']],
+            kpts[KEYPOINT_INDICES['right_ankle']]
+        )
+        symmetry_ok = abs(knee_angle - right_knee_angle) < 20
+    else:
+        symmetry_ok = True
+    
+    return all([min_angle_ok, hip_knee_diff_ok, knee_over_toes_ok, speed_ok, symmetry_ok])
 
-def analyze_exercise(video_path, exercise):
-    # Special case for torso rotation in Russian Twist
-    is_russian = (exercise == 'Russian Twist')
-    if is_russian:
-        twist_left_idx = KEYPOINT_INDICES['left_shoulder']
-        twist_right_idx = KEYPOINT_INDICES['right_shoulder']
-    cap = cv2.VideoCapture(video_path)
+def process_frame(frame, exercise, state):
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = pose.process(frame_rgb)
+    
+    if not results.pose_landmarks:
+        return None, None
+    
+    h, w = frame.shape[:2]
+    state['frame_width'] = w
+    state['frame_height'] = h
+    
+    kpts = np.array([[lm.x * w, lm.y * h] for lm in results.pose_landmarks.landmark])
+    
+    required_points = [KEYPOINT_INDICES[p] for p in EXERCISES[exercise]['points']]
+    if any(kpts[i][0] == 0 and kpts[i][1] == 0 for i in required_points):
+        return None, None
+    
+    # УГОЛ
+    points = [KEYPOINT_INDICES[p] for p in EXERCISES[exercise]['points']]
+    a, b, c = kpts[points[0]], kpts[points[1]], kpts[points[2]]
+    angle = compute_angle(a, b, c)
+    
+    if exercise == 'Squats':
+        is_valid = is_valid_squat(kpts, EXERCISES[exercise], state)
+    else:
+        is_valid = True
+    
+    threshold = EXERCISES[exercise]['threshold']
+    if angle > threshold + 5:
+        state['stage'] = "down"
+    if angle < threshold - 5 and state['stage'] == "down" and is_valid:
+        state['stage'] = "up"
+        state['counter'] += 1
+    
+    annotated_frame = frame.copy()
+    draw_landmarks(annotated_frame, results.pose_landmarks)
+    
+    # ПОЛОЖЕНИЕ ЧЕЛОВЕКА
+    is_profile = is_profile_view(kpts, w)
+    view_text = "Profile" if is_profile else "Front/Back"
+    view_color = (0, 255, 255) if is_profile else (255, 255, 0)
+    
+    # ТЕКСТ
+    cv2.putText(annotated_frame, f"Count: {state['counter']}", (12, 42), 
+               cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 3)
+    cv2.putText(annotated_frame, f"Count: {state['counter']}", (10, 40), 
+               cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 3)
+    
+    cv2.putText(annotated_frame, f"Angle: {angle:.1f}", (12, 82), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+    cv2.putText(annotated_frame, f"Angle: {angle:.1f}", (10, 80), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+    
+    cv2.putText(annotated_frame, f"View: {view_text}", (12, 122), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+    cv2.putText(annotated_frame, f"View: {view_text}", (10, 120), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.8, view_color, 2)
+    
+    if exercise == 'Squats':
+        validity_text = "Valid" if is_valid else "Invalid"
+        validity_color = (0, 255, 0) if is_valid else (0, 0, 255)
+        cv2.putText(annotated_frame, f"Squat: {validity_text}", (12, 162), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+        cv2.putText(annotated_frame, f"Squat: {validity_text}", (10, 160), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, validity_color, 2)
+    
+    return kpts, annotated_frame
 
-    anglesL = []
-    anglesR = []
-    confsL = []
-    confsR = []
-    aggr_angles = []
-    processed_frames = []
+#ВСЯКИЕ СТИЛИ
 
-    sides = EXERCISES[exercise]
-    left_names = sides['left']
-    right_names = sides['right']
-    left_idx = [KEYPOINT_INDICES[name] for name in left_names]
-    right_idx = [KEYPOINT_INDICES[name] for name in right_names]
+st.markdown(
+    """
+    <style>
+    /* Основные стили приложения */
+    .stApp {
+        background-color: #97a897;
+    }
+    
+    /* Стили для вкладок */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 10px;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        padding: 10px 20px;
+        border-radius: 8px 8px 0 0;
+        background-color: #6a8a6a;
+        color: white;
+        font-weight: bold;
+        transition: all 0.3s ease;
+        font-family: 'Arial', sans-serif; /* Изменение шрифта */
+    }
+    
+    .stTabs [data-baseweb="tab"]:hover {
+        background-color: #5a7a5a;
+        color: white;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background-color: #4a6b4a;
+        color: white;
+        border-bottom: 3px solid #ffd700; /* Желтая полоса вместо красного */
+        font-weight: bold;
+    }
+    
+    /* Остальные ваши стили */
+    .repetition-counter {
+        background-color: #4a6b4a;
+        color: white;
+        padding: 0.75rem 1.5rem;
+        border-radius: 12px;
+        font-size: 1.4rem;
+        font-weight: bold;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+        border: 2px solid #3a553a;
+        margin: 1.5rem 0;
+        text-align: center;
+        display: inline-block;
+    }
+    .repetition-counter span {
+        font-size: 1.8rem;
+        color: #ffd700;
+        text-shadow: 1px 1px 2px rgba(0,0,0,0.3);
+    }
+    .exercise-title {
+        color: #2d4d2d;
+        font-weight: bold;
+        font-size: 1.2rem;
+        margin-bottom: 0.75rem;
+        padding-bottom: 0.5rem;
+        border-bottom: 2px solid #4a6b4a;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+st.title("🏋️Фитнес-трекер")
 
-        kpts, confs, plotted_frame = process_frame(frame)
-
-        angleL, angleR, angle, confL, confR = get_angle_data(kpts, confs, is_russian, left_idx, right_idx)
-        if angle is None:
-            continue
-        anglesL.append(angleL)
-        anglesR.append(angleR)
-        confsL.append(confL)
-        confsR.append(confR)
-        aggr_angles.append(angle)
-
-        processed_frames.append(plotted_frame)
-
-    cap.release()
-    return processed_frames, anglesL, anglesR, confsL, confsR, aggr_angles
-
-def count_repetitions(angles, mode='min'):
-    smoothed = savgol_filter(angles, window_length=21, polyorder=3)
-    arr = np.array(smoothed)
-    # Choose data to detect peaks: minima (-arr) or maxima (arr)
-    data = -arr if mode == 'min' else arr
-    peaks, _ = find_peaks(data, distance=20, prominence=10)
-    return len(peaks), smoothed, peaks
-
-from enum import Enum, auto
-
-
-WINDOW_SIZE   = 21
-POLY_ORDER    = 3
-
-EMA_ALPHA       = 0.3
-VEL_THRESH      = 1.5
-ANGLE_DELTA_MIN = 20.0
-HIGHLIGHT_FRM   = 10
-
-
-class Phase(Enum):
-    UNKNOWN = auto()
-    DESCENT = auto()
-    ASCENT  = auto()
-
-@dataclass
-class State:
-    ema: Optional[float] = None
-    prev_ema: Optional[float] = None
-    phase: Phase = Phase.UNKNOWN
-    top_angle: float = 0.0
-    bottom_angle: float = 0.0
-    count: int = 0
-    highlight_until: int = 0
-    angles: List[float] = field(default_factory=list)
-
-def make_callback(exercise: str):
-    if exercise not in EXERCISES:
-        raise ValueError(f"Unknown exercise: {exercise}")
-
-    sides = EXERCISES[exercise]
-    left_idx  = [KEYPOINT_INDICES[n] for n in sides["left"]]
-    right_idx = [KEYPOINT_INDICES[n] for n in sides["right"]]
-
-    state = State()
-    is_russian = (exercise == "Russian Twist")
-    mode = COUNT_MODES.get(exercise, "min")  # 'min'|'max'
-
-    def callback(frame: av.VideoFrame) -> av.VideoFrame:
-        nonlocal state
-        idx = len(state.angles)
-        img = frame.to_ndarray(format="bgr24")
-        h, w = img.shape[:2]
-
-        # --- 1. Pose ------------------------------------------------------
-        try:
-            kpts, confs, plotted = process_frame(img)
-        except Exception:
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
-        if kpts is None or confs is None:
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-        # --- 2. Angle -----------------------------------------------------
-        angleL, angleR, angle_raw, *_ = get_angle_data(
-            kpts, confs, is_russian, left_idx, right_idx)
-        if angle_raw is None:
-            canvas = plotted.copy()
-            cv2.putText(canvas, f"Angle: N/A", (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (255, 255, 255), 2)
-            cv2.putText(canvas, f"Count: {state.count}", (w - 200, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                        1, (0, 255, 255), 2)
-            return av.VideoFrame.from_ndarray(canvas, format="bgr24")
-
-        angle = -angle_raw if mode == "max" else angle_raw
-        state.angles.append(angle)
-
-        # --- 3. EMA + velocity -------------------------------------------
-        if state.ema is None:
-            state.ema = angle
-            state.prev_ema = angle
-        else:
-            state.prev_ema = state.ema
-            state.ema = EMA_ALPHA * angle + (1 - EMA_ALPHA) * state.ema
-        vel = state.ema - state.prev_ema  # °/кадр
-
-        # --- 4. 2‑фазный FSM ---------------------------------------------
-        if state.phase in (Phase.UNKNOWN, Phase.ASCENT):
-            if vel < -VEL_THRESH:
-                state.phase = Phase.DESCENT
-                state.top_angle = state.ema
-        if state.phase == Phase.DESCENT and vel > VEL_THRESH:
-            state.phase = Phase.ASCENT
-            state.bottom_angle = state.ema
-            if (state.top_angle - state.bottom_angle) >= ANGLE_DELTA_MIN:
-                state.count += 1
-                state.highlight_until = idx + HIGHLIGHT_FRM
-        if state.phase == Phase.ASCENT and vel < -VEL_THRESH:
-            # начало нового спуска без завершения подъёма – перезаписать top
-            state.phase = Phase.DESCENT
-            state.top_angle = state.ema
-
-        # --- 5. Overlay ---------------------------------------------------
-        canvas = plotted
-        if idx <= state.highlight_until:
-            cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), (0, 255, 0), 10)
-        cv2.putText(canvas, f"Angle: {angle_raw:.0f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (255, 255, 255), 2)
-        cv2.putText(canvas, f"Count: {state.count}", (w - 200, 40), cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (0, 255, 255), 2)
-        cv2.putText(canvas, f"Phase: {state.phase.name}", (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8, (200, 200, 200), 2)
-
-        return av.VideoFrame.from_ndarray(canvas, format="bgr24")
-
-    return callback
-
-upload_tab, live_stream_tab = st.tabs(["Upload video", "Live Stream"])
+upload_tab, live_stream_tab = st.tabs(["📁 Анализ видео", "📷 Live режим"])
 
 with upload_tab:
-    exercises = list(EXERCISES.keys())
-    exercise = st.selectbox("Select exercise to analyze", exercises)
-    st.title(f"🏋️ Repetition Counter: {exercise}")
-    st.write(f"Upload video for {exercise} analysis")
-
-    uploaded_file = st.file_uploader("Choose a video...", type=["mp4", "avi", "mov"])
-
-    if uploaded_file is not None:
-        tfile = tempfile.NamedTemporaryFile(delete=False)
-        tfile.write(uploaded_file.read())
-        tfile.flush()
-
-        st.video(uploaded_file)
-        sides = EXERCISES[exercise]
-        left_names = sides['left']
-        right_names = sides['right']
-        left_idx = [KEYPOINT_INDICES[name] for name in left_names]
-        right_idx = [KEYPOINT_INDICES[name] for name in right_names]
-        st.write(f"**Used keypoints:** {', '.join(left_names)} (indices {', '.join(map(str, left_idx))}); {', '.join(right_names)} (indices {', '.join(map(str, right_idx))})")
-
-        if st.button("Analyze"):
-            with st.spinner('Processing video...'):
-                frames, anglesL, anglesR, confsL, confsR, angles = analyze_exercise(tfile.name, exercise)
-                # Determine whether to detect minima or maxima for this exercise
-                mode = COUNT_MODES.get(exercise, 'min')
-                count, smoothed, peaks = count_repetitions(angles, mode)
-
-                st.success(f"**Number of repetitions ({exercise}):** {count}")
-                # Annotated video generation with persistent highlight
-                is_peak = np.zeros(len(angles), dtype=bool)
-                is_peak[peaks] = True
-                cum_counts = np.cumsum(is_peak)
-                cap_in = cv2.VideoCapture(tfile.name)
-                fps = cap_in.get(cv2.CAP_PROP_FPS) or 30
-                cap_in.release()
-                h, w = frames[0].shape[:2]
-                vfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-                fourcc = cv2.VideoWriter_fourcc(*'avc1')
-                out = cv2.VideoWriter(vfile.name, fourcc, fps, (w, h))
-                # Highlight duration in seconds
-                highlight_duration = 0.5
-                highlight_len = int(fps * highlight_duration)
-                highlight_until = -1
-                for i, frame in enumerate(frames):
-                    f = frame.copy()
-                    angle_val = angles[i]
-                    count_val = int(cum_counts[i])
-                    if is_peak[i]:
-                        highlight_until = i + highlight_len
-                    if i <= highlight_until:
-                        cv2.rectangle(f, (0,0), (w-1,h-1), (0,255,0), 10)
-                    # Overlay angle text
-                    cv2.putText(f, f"Angle: {angle_val:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 2)
-                    # Overlay count text
-                    cv2.putText(f, f"Count: {count_val}", (w-200, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
-                    out.write(f)
-                out.release()
-                # Display annotated video
-                st.video(vfile.name)
-
-                with st.expander("Show plots"):
-                    # Angles
-                    fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(10, 8))
-                    ax1.plot(anglesL, label='Left Angle', color='blue', alpha=0.3)
-                    ax1.plot(anglesR, label='Right Angle', color='red', alpha=0.3)
-                    ax1.plot(smoothed, label='Total Angle', color='black')
-                    ax1.plot(peaks, smoothed[peaks], 'x', color='red', label='Peaks')
-                    ax1.set_ylabel('Angle (degrees)')
-                    ax1.legend(loc='upper right')
-                    # Confidence
-                    ax2.plot(confsL, label='Confidence Left', color='blue', linestyle='--')
-                    ax2.plot(confsR, label='Confidence Right', color='red', linestyle='--')
-                    ax2.set_xlabel('Frames')
-                    ax2.set_ylabel('Confidence')
-                    ax2.legend(loc='upper right')
-                    plt.tight_layout()
-                    st.pyplot(fig)
+    with st.container():
+        st.markdown('<div class="tab-container">', unsafe_allow_html=True)
+        
+        exercise = st.selectbox("Выберите упражнение", list(EXERCISES.keys()))
+        st.markdown(f'<p class="exercise-title">Текущее упражнение: {exercise}</p>', unsafe_allow_html=True)
+        
+        uploaded_file = st.file_uploader("Загрузите видео", type=["mp4", "mov"])
+        
+        if uploaded_file and st.button("Анализировать", type="primary"):
+            state = {
+                'counter': 0, 
+                'stage': None,
+                'last_hip_y': None,
+                'last_hip_time': None,
+                'frame_width': None,
+                'frame_height': None
+            }
+            tfile = tempfile.NamedTemporaryFile(delete=False)
+            tfile.write(uploaded_file.read())
+            
+            cap = cv2.VideoCapture(tfile.name)
+            angles = []
+            processed_frames = []
+            counter = 0
+            stage = None
+            
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                    
+                result = process_frame(frame, exercise, state)
+                if result is None:
+                    continue
+                    
+                kpts, processed = result
+                points = [KEYPOINT_INDICES[p] for p in EXERCISES[exercise]['points']]
+                
+                try:
+                    a, b, c = kpts[points]
+                    angle = compute_angle(a, b, c)
+                    angles.append(angle)
+                    
+                    threshold = EXERCISES[exercise]['threshold']
+                    if angle > threshold + 5:
+                        stage = "down"
+                    if angle < threshold - 5 and stage == "down":
+                        stage = "up"
+                        counter += 1
+                    
+                    cv2.putText(processed, f"Count: {counter}", (12, 42), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 3)
+                    cv2.putText(processed, f"Count: {counter}", (10, 40), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 3)
+                    
+                    cv2.putText(processed, f"Angle: {angle:.1f}", (12, 82), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+                    cv2.putText(processed, f"Angle: {angle:.1f}", (10, 80), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+                    
+                    processed_frames.append(processed)
+                
+                except Exception as e:
+                    print(f"Ошибка обработки кадра: {e}")
+            
+            cap.release()
+            
+            st.markdown(
+                f'<div class="repetition-counter">Всего повторений: <span>{counter}</span></div>',
+                unsafe_allow_html=True
+            )
 
 with live_stream_tab:
-    exercises_live = list(EXERCISES.keys())
-    exercise_live = st.selectbox("Select exercise for live analysis", exercises_live, key="live_exercise")
-    st.title(f"🏋️ Live Repetition Counter: {exercise_live}")
-    st.write(f"Streaming live for {exercise_live} analysis")
-    webrtc_ctx = webrtc_streamer(
-        key="skeleton",
-        mode=WebRtcMode.SENDRECV,
-        video_frame_callback=make_callback(exercise_live),
-        media_stream_constraints={"video": True, "audio": False},
-        async_processing=True,
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-    )
+    with st.container():
+        st.markdown('<div class="tab-container">', unsafe_allow_html=True)
+        
+        exercise_live = st.selectbox("Упражнение", list(EXERCISES.keys()), key="live")
+        st.markdown(f'<p class="exercise-title">Текущее упражнение: {exercise_live}</p>', unsafe_allow_html=True)
+        
+        class LiveState:
+            def __init__(self):
+                self.counter = 0
+                self.stage = None
+                self.last_hip_y = None
+                self.last_hip_time = None
+                self.frame_width = None
+                self.frame_height = None
+                self.pose = mp_pose.Pose(
+                    min_detection_confidence=0.8,
+                    min_tracking_confidence=0.8
+                )
+        
+        state = LiveState()
+        
+        def video_frame_callback(frame):
+            img = frame.to_ndarray(format="bgr24")
+            h, w = img.shape[:2]
+            state.frame_width = w
+            state.frame_height = h
+            
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = state.pose.process(img_rgb)
+            
+            if not results.pose_landmarks:
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
+            
+            kpts = np.array([[lm.x * w, lm.y * h] for lm in results.pose_landmarks.landmark])
+            
+            # УГОЛ
+            points = [KEYPOINT_INDICES[p] for p in EXERCISES[exercise_live]['points']]
+            a, b, c = kpts[points[0]], kpts[points[1]], kpts[points[2]]
+            angle = compute_angle(a, b, c)
+            
+            if exercise_live == 'Squats':
+                is_valid = is_valid_squat(kpts, EXERCISES[exercise_live], state.__dict__)
+            else:
+                is_valid = True
+            
+            threshold = EXERCISES[exercise_live]['threshold']
+            if angle > threshold + 5:
+                state.stage = "down"
+            if angle < threshold - 5 and state.stage == "down" and is_valid:
+                state.stage = "up"
+                state.counter += 1
+            
+            annotated_image = img.copy()
+            draw_landmarks(annotated_image, results.pose_landmarks)
+            
+            is_profile = is_profile_view(kpts, w)
+            view_text = "Profile" if is_profile else "Front/Back"
+            view_color = (0, 255, 255) if is_profile else (255, 255, 0)
+            
+            cv2.putText(annotated_image, f"Count: {state.counter}", (12, 42), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 3)
+            cv2.putText(annotated_image, f"Count: {state.counter}", (10, 40), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255), 3)
+            
+            cv2.putText(annotated_image, f"Angle: {angle:.1f}", (12, 82), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+            cv2.putText(annotated_image, f"Angle: {angle:.1f}", (10, 80), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+            
+            cv2.putText(annotated_image, f"View: {view_text}", (12, 122), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+            cv2.putText(annotated_image, f"View: {view_text}", (10, 120), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, view_color, 2)
+            
+            if exercise_live == 'Squats':
+                validity_text = "Valid" if is_valid else "Invalid"
+                validity_color = (0, 255, 0) if is_valid else (0, 0, 255)
+                cv2.putText(annotated_image, f"Squat: {validity_text}", (12, 162), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+                cv2.putText(annotated_image, f"Squat: {validity_text}", (10, 160), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, validity_color, 2)
+            
+            return av.VideoFrame.from_ndarray(annotated_image, format="bgr24")
+        
+        webrtc_ctx = webrtc_streamer(
+            key="squats-counter",
+            mode=WebRtcMode.SENDRECV,
+            video_frame_callback=video_frame_callback,
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 20}
+                },
+                "audio": False
+            },
+            async_processing=True,
+            rtc_configuration={
+                "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+            }
+        )
+        
+        if webrtc_ctx.state.playing:
+            st.markdown(
+                f'<div class="repetition-counter">Текущее количество: <span>{state.counter}</span></div>',
+                unsafe_allow_html=True
+            )
+        
+        st.markdown('</div>', unsafe_allow_html=True)
